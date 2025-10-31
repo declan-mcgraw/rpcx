@@ -149,18 +149,18 @@ async def test_raise_on_error(test_client):
     client = test_client.client
 
     async with anyio.create_task_group() as task_group:
-        task_group.start_soon(client.request, "any")
-        await anyio.wait_all_tasks_blocked()
+        async with client.request_stream("any"):
+            await anyio.wait_all_tasks_blocked()
 
-        client.tasks[1].stream_producer.close()
+            client.tasks[1].chunk_producer.close()
 
-        msg = ResponseStreamChunk(id=1, value=None)
-        await test_client.server_stream.send(message_to_bytes(msg))
+            msg = ResponseStreamChunk(id=1, value=None)
+            await test_client.server_stream.send(message_to_bytes(msg))
 
-        with pytest.raises(anyio.ClosedResourceError):
-            client.raise_on_error = True
-            await client.receive_loop()
-        task_group.cancel_scope.cancel()
+            with pytest.raises(anyio.ClosedResourceError):
+                client.raise_on_error = True
+                await client.receive_loop()
+            task_group.cancel_scope.cancel()
 
 
 async def test_remoteerror(test_client):

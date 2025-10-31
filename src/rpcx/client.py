@@ -2,12 +2,12 @@ import logging
 import math
 from collections.abc import Awaitable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Coroutine, Dict, Generator, Optional
 
 import anyio
 from anyio.abc import AnyByteStream
-from anyio.streams.memory import MemoryObjectReceiveStream
+from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 
 from .message import (
     Message,
@@ -49,36 +49,34 @@ class InternalError(ClientError):
     """
 
 
+@dataclass
 class _RequestTask:
     """
     Container for streams associated with a request.
     """
 
-    _value: Any = object()
-
-    def __init__(self) -> None:
-        # There will only ever be one response, buffer size of 1 is appropriate
-        self.response_producer, self.response_consumer = anyio.create_memory_object_stream[Response](1)
-        # There may be many stream chunks, do not block on receiving them.
-        self.stream_producer, self.stream_consumer = anyio.create_memory_object_stream[Any](math.inf)
+    response_producer: MemoryObjectSendStream[Response]
+    response_consumer: MemoryObjectReceiveStream[Response]
+    # Referenced by receive_loop to handle RequestStream, unused for simple requests
+    chunk_producer: Optional[MemoryObjectSendStream[Any]] = field(default=None)
+    _value: Any = field(default=object())
 
     async def get_response(self) -> Any:
         if self._value is not _RequestTask._value:
             # return cached value
             return self._value
 
-        with self.response_producer, self.response_consumer:
-            response = await self.response_consumer.receive()
-            self._value = response.value
+        response = await self.response_consumer.receive()
+        self._value = response.value
 
-            if response.status_is_ok:
-                return self._value
-            elif response.status_is_invalid:
-                raise InvalidValue(response.value)
-            elif response.status_is_internal:
-                raise InternalError(response.value)
-            else:
-                raise RemoteError(response.value)
+        if response.status_is_ok:
+            return self._value
+        elif response.status_is_invalid:
+            raise InvalidValue(response.value)
+        elif response.status_is_internal:
+            raise InternalError(response.value)
+        else:
+            raise RemoteError(response.value)
 
 
 @dataclass(repr=False)
@@ -146,11 +144,14 @@ class RPCClient:
 
     async def request(self, method: str, *args: Any, **kwargs: Any) -> Any:
         req = Request(id=self.next_msg_id, method=method, args=args, kwargs=kwargs)
+        # There will only ever be one response, buffer size of 1 is appropriate
+        response_producer, response_consumer = anyio.create_memory_object_stream[Response](1)
         await self.send_msg(req)
-        task = self.tasks[req.id] = _RequestTask()
+        task = self.tasks[req.id] = _RequestTask(response_producer, response_consumer)
 
         try:
-            return await task.get_response()
+            with response_producer, response_consumer:
+                return await task.get_response()
         except anyio.get_cancelled_exc_class():
             with anyio.CancelScope(shield=True):
                 await self.send_msg(RequestCancel(req.id))
@@ -161,8 +162,12 @@ class RPCClient:
     @asynccontextmanager
     async def request_stream(self, method: str, *args: Any, **kwargs: Any) -> AsyncIterator[RequestStream]:
         req = Request(id=self.next_msg_id, method=method, args=args, kwargs=kwargs)
+        # There will only ever be one response, buffer size of 1 is appropriate
+        response_producer, response_consumer = anyio.create_memory_object_stream[Response](1)
+        # There may be many stream chunks, do not block on receiving them
+        chunk_producer, chunk_consumer = anyio.create_memory_object_stream[Any](math.inf)
         await self.send_msg(req)
-        task = self.tasks[req.id] = _RequestTask()
+        task = self.tasks[req.id] = _RequestTask(response_producer, response_consumer, chunk_producer)
 
         did_send_chunk = False
 
@@ -173,12 +178,12 @@ class RPCClient:
 
         stream = RequestStream(
             _get_response=task.get_response,
-            _stream_consumer=task.stream_consumer,
+            _stream_consumer=chunk_consumer,
             send=send_stream_chunk,
         )
 
         try:
-            with task.stream_producer, task.stream_consumer:
+            with response_producer, response_consumer, chunk_producer, chunk_consumer:
                 yield stream
                 if did_send_chunk:
                     # Sent a stream chunk, must send the stream end
@@ -205,10 +210,10 @@ class RPCClient:
                 try:
                     if isinstance(msg, Response):
                         await task.response_producer.send(msg)
-                    elif isinstance(msg, ResponseStreamChunk):
-                        await task.stream_producer.send(msg.value)
-                    elif isinstance(msg, ResponseStreamEnd):
-                        task.stream_producer.close()
+                    elif isinstance(msg, ResponseStreamChunk) and task.chunk_producer:
+                        await task.chunk_producer.send(msg.value)
+                    elif isinstance(msg, ResponseStreamEnd) and task.chunk_producer:
+                        task.chunk_producer.close()
                     else:
                         LOG.warning("Received unhandled message: %s", msg)
                 except anyio.get_cancelled_exc_class():  # pragma: nocover
