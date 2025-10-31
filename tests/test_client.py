@@ -1,3 +1,5 @@
+from unittest.mock import AsyncMock
+
 import anyio
 import pytest
 
@@ -188,3 +190,13 @@ async def test_internalerror(test_client):
     async with test_client.client as client:
         with pytest.raises(InternalError):
             await client.request("any")
+
+
+async def test_request_end_of_stream(test_client):
+    with anyio.fail_after(1):
+        async with test_client.client as client:
+            client.raise_on_error = False
+            client.stream.receive = AsyncMock(side_effect=anyio.EndOfStream())
+            with pytest.raises(anyio.EndOfStream):
+                # Previously caused client to hang
+                await client.request("any")
