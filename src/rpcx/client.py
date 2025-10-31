@@ -146,8 +146,9 @@ class RPCClient:
         req = Request(id=self.next_msg_id, method=method, args=args, kwargs=kwargs)
         # There will only ever be one response, buffer size of 1 is appropriate
         response_producer, response_consumer = anyio.create_memory_object_stream[Response](1)
-        await self.send_msg(req)
         task = self.tasks[req.id] = _RequestTask(response_producer, response_consumer)
+
+        await self.send_msg(req)
 
         try:
             with response_producer, response_consumer:
@@ -166,9 +167,7 @@ class RPCClient:
         response_producer, response_consumer = anyio.create_memory_object_stream[Response](1)
         # There may be many stream chunks, do not block on receiving them
         chunk_producer, chunk_consumer = anyio.create_memory_object_stream[Any](math.inf)
-        await self.send_msg(req)
         task = self.tasks[req.id] = _RequestTask(response_producer, response_consumer, chunk_producer)
-
         did_send_chunk = False
 
         async def send_stream_chunk(value: Any) -> None:
@@ -181,6 +180,8 @@ class RPCClient:
             _stream_consumer=chunk_consumer,
             send=send_stream_chunk,
         )
+
+        await self.send_msg(req)
 
         try:
             with response_producer, response_consumer, chunk_producer, chunk_consumer:
@@ -200,29 +201,37 @@ class RPCClient:
         """
         Receives data on the websocket and runs handlers.
         """
-        async for data in self.stream:
-            msg = message_from_bytes(data)
-            task = self.tasks.get(msg.id)
 
-            # If we cancel a request, it is possible that responses could come after deleting the task.
-            # In this case, we do not care about those responses.
-            if task is not None:
-                try:
-                    if isinstance(msg, Response):
-                        await task.response_producer.send(msg)
-                    elif isinstance(msg, ResponseStreamChunk) and task.chunk_producer:
-                        await task.chunk_producer.send(msg.value)
-                    elif isinstance(msg, ResponseStreamEnd) and task.chunk_producer:
-                        task.chunk_producer.close()
-                    else:
-                        LOG.warning("Received unhandled message: %s", msg)
-                except anyio.get_cancelled_exc_class():  # pragma: nocover
-                    raise
-                except:
-                    if self.raise_on_error:
+        try:
+            async for data in self.stream:
+                msg = message_from_bytes(data)
+                task = self.tasks.get(msg.id)
+
+                # If we cancel a request, it is possible that responses could come after deleting the task.
+                # In this case, we do not care about those responses.
+                if task is not None:
+                    try:
+                        if isinstance(msg, Response):
+                            await task.response_producer.send(msg)
+                        elif isinstance(msg, ResponseStreamChunk) and task.chunk_producer:
+                            await task.chunk_producer.send(msg.value)
+                        elif isinstance(msg, ResponseStreamEnd) and task.chunk_producer:
+                            task.chunk_producer.close()
+                        else:
+                            LOG.warning("Received unhandled message: %s", msg)
+                    except anyio.get_cancelled_exc_class():  # pragma: nocover
                         raise
-                    else:
-                        LOG.exception("Client receive error: %s", msg)
+                    except:
+                        if self.raise_on_error:
+                            raise
+                        else:
+                            LOG.exception("Client receive error: %s", msg)
+        finally:
+            for task in self.tasks.values():
+                # Raises EndOfStream for any requests waiting on responses
+                if task.chunk_producer is not None:
+                    task.chunk_producer.close()
+                task.response_producer.close()
 
     async def send_msg(self, msg: Message) -> None:
         await self.stream.send(message_to_bytes(msg))
