@@ -221,25 +221,25 @@ class RPCClient:
                 msg = message_from_bytes(data)
                 task = self.tasks.get(msg.id)
 
-                # If we cancel a request, it is possible that responses could come after deleting the task.
-                # In this case, we do not care about those responses.
-                if task is not None:
-                    try:
-                        if isinstance(msg, Response):
-                            await task.response_producer.send(msg)
-                        elif isinstance(msg, ResponseStreamChunk):
-                            await task.stream_producer.send(msg.value)
-                        elif isinstance(msg, ResponseStreamEnd):
-                            task.stream_producer.close()
-                        else:
-                            LOG.warning("Received unhandled message: %s", msg)
-                    except anyio.get_cancelled_exc_class():  # pragma: nocover
+                if task is None:
+                    raise RuntimeError(f"Message {msg.id} does not have a valid task.")
+
+                try:
+                    if isinstance(msg, Response):
+                        await task.response_producer.send(msg)
+                    elif isinstance(msg, ResponseStreamChunk):
+                        await task.stream_producer.send(msg.value)
+                    elif isinstance(msg, ResponseStreamEnd):
+                        task.stream_producer.close()
+                    else:
+                        LOG.warning("Received unhandled message: %s", msg)
+                except anyio.get_cancelled_exc_class():  # pragma: nocover
+                    raise
+                except:
+                    if self.raise_on_error:
                         raise
-                    except:
-                        if self.raise_on_error:
-                            raise
-                        else:
-                            LOG.exception("Client receive error: %s", msg)
+                    else:
+                        LOG.exception("Client receive error: %s", msg)
         finally:
             self._closed = True
             # Ensure any remaining requests do not hang, raises EndOfStream exception within remaining requests
